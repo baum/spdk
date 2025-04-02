@@ -157,7 +157,7 @@ DEPDIRS-bdev_raid := $(BDEV_DEPS_THREAD) trace
 ifeq ($(CONFIG_RAID5F),y)
 DEPDIRS-bdev_raid += accel
 endif
-DEPDIRS-bdev_rbd := $(BDEV_DEPS_THREAD)
+DEPDIRS-bdev_rbd := $(BDEV_DEPS_THREAD) nvmf
 DEPDIRS-bdev_uring := $(BDEV_DEPS_THREAD)
 DEPDIRS-bdev_virtio := $(BDEV_DEPS_THREAD) virtio
 DEPDIRS-bdev_zone_block := $(BDEV_DEPS_THREAD)

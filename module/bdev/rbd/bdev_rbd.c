@@ -12,6 +12,7 @@
 
 #include "spdk/env.h"
 #include "spdk/bdev.h"
+#include "spdk/nvmf.h"
 #include "spdk/thread.h"
 #include "spdk/json.h"
 #include "spdk/string.h"
@@ -1540,6 +1541,7 @@ static void
 bdev_rbd_library_fini(void)
 {
 	spdk_io_device_unregister(&rbd_if, NULL);
+	spdk_nvmf_set_custom_ns_reservation_ops(NULL);
 }
 
 SPDK_LOG_REGISTER_COMPONENT(bdev_rbd)

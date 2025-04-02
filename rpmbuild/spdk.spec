@@ -86,8 +86,8 @@ _PKGDEP_OPTS="$_PKGDEP_OPTS --rbd"
 # Rely mainly on CONFIG
 #git submodule update --init
 ./configure --disable-unit-tests --disable-tests %{configure}
-make %{make}
-make DESTDIR=%{buildroot} install %{make}
+make V=1 %{make}
+make V=1 DESTDIR=%{buildroot} install %{make}
 # DPDK always builds both static and shared, so we need to remove one or the other
 # SPDK always builds static, so remove it if we want shared.
 %if %{shared}
