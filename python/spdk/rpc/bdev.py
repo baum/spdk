@@ -1167,6 +1167,24 @@ def bdev_rbd_set_with_crc32c(client, enable):
     return client.call('bdev_rbd_set_with_crc32c', params)
 
 
+def bdev_rbd_get_with_spdk_wq(client):
+    """Get SPDK ContextWQ usage in RBD operations.
+    Returns:
+        True if SPDK ContextWQ is enabled, False otherwise
+    """
+    return client.call('bdev_rbd_get_with_spdk_wq')
+
+
+def bdev_rbd_set_with_spdk_wq(client, enable):
+    """Set SPDK ContextWQ usage in RBD operations.
+    Args:
+        enable: enable or disable SPDK ContextWQ (False uses AsioContextWQ)
+    """
+    params = dict()
+    params['enable'] = enable
+    return client.call('bdev_rbd_set_with_spdk_wq', params)
+
+
 @deprecated_method
 def bdev_error_create(client, base_name, uuid=None):
     """Construct an error injection block device.

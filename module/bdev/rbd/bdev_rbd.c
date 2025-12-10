@@ -6,6 +6,7 @@
 #include "spdk/stdinc.h"
 
 #include "bdev_rbd.h"
+#include "bdev_rbd_spdk_context_wq.h"
 
 #include <rbd/librbd.h>
 #include <rados/librados.h>
@@ -20,6 +21,10 @@
 #include "spdk/bdev_module.h"
 #include "spdk/log.h"
 
+/* to access reactor framework */
+#include "spdk_internal/event.h"
+#include "spdk_internal/thread.h"
+
 SPDK_LOG_REGISTER_COMPONENT(reservation)
 
 static int bdev_rbd_count = 0;
@@ -28,6 +33,7 @@ static int bdev_rbd_count = 0;
  * global parameter to control CRC32C usage in RBD write operations.
  */
 static bool g_rbd_with_crc32c = false;
+static bool g_rbd_with_spdk_wq = false;
 
 struct bdev_rbd_pool_ctx {
 	rados_t *cluster_p;
@@ -74,6 +80,9 @@ struct bdev_rbd {
 	void *reservation_ns_context;
 	int (*reservation_fn_cbk)(void *ns);
 	char cluster_fsid[37];
+
+	/* SPDK ContextWQ for this bdev */
+	struct bdev_rbd_spdk_context_wq *spdk_context_wq;
 
 };
 
@@ -222,6 +231,16 @@ bdev_rbd_free(struct bdev_rbd *rbd)
 		rbd_update_unwatch(rbd->image, rbd->rbd_watch_handle);
 		rbd_flush(rbd->image);
 		rbd_close(rbd->image);
+	}
+
+	/* Clean up SPDK ContextWQ after RBD image is closed.
+	 * This ensures no new I/O completions can occur after ContextWQ is destroyed.
+	 * The drain() function in the destructor will wait for any pending messages
+	 * to complete before the ContextWQ is actually destroyed.
+	 */
+	if (rbd->spdk_context_wq != NULL) {
+		bdev_rbd_spdk_context_wq_destroy(rbd->spdk_context_wq);
+		rbd->spdk_context_wq = NULL;
 	}
 
 	free(rbd->disk.name);
@@ -459,6 +478,9 @@ err_handle:
 	return -1;
 }
 
+/* Forward declaration for reactor thread selection function */
+static struct spdk_thread *bdev_rbd_find_reactor_thread(void);
+
 static void *
 bdev_rbd_init_context(void *arg)
 {
@@ -488,11 +510,21 @@ bdev_rbd_init_context(void *arg)
 	}
 
 	assert(io_ctx != NULL);
+	if (g_rbd_with_spdk_wq) {
+		/* Find reactor thread, create SpdkContextWQ if available, then open with context_wq (NULL uses default AsioContextWQ) */
+		struct spdk_thread *reactor_thread = bdev_rbd_find_reactor_thread();
+		rbd->spdk_context_wq = bdev_rbd_spdk_context_wq_create_from_ioctx(
+			*io_ctx, reactor_thread);
+	} else {
+		rbd->spdk_context_wq = NULL;
+		SPDK_NOTICELOG("rbd_with_spdk_wq is disabled, using AsioContextWQ for RBD image %s/%s\n",
+			       rbd->pool_name, rbd->rbd_name);
+	}
 	if (rbd->rbd_read_only) {
 		SPDK_DEBUGLOG(bdev_rbd, "Will open RBD image %s/%s as read-only\n", rbd->pool_name, rbd->rbd_name);
-		rc = rbd_open_read_only(*io_ctx, rbd->rbd_name, &rbd->image, NULL);
+		rc = rbd_open_read_only_with_context_wq(*io_ctx, rbd->rbd_name, &rbd->image, NULL, rbd->spdk_context_wq);
 	} else {
-		rc = rbd_open(*io_ctx, rbd->rbd_name, &rbd->image, NULL);
+		rc = rbd_open_with_context_wq(*io_ctx, rbd->rbd_name, &rbd->image, NULL, rbd->spdk_context_wq);
 	}
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to open specified rbd device\n");
@@ -728,6 +760,46 @@ static struct spdk_bdev_module rbd_if = {
 
 };
 SPDK_BDEV_MODULE_REGISTER(rbd, &rbd_if)
+
+/**
+ * Find a reactor thread for SpdkContextWQ.
+ * Iterates through reactors to find a reactor thread (not app_thread).
+ * Returns NULL if no suitable thread is found.
+ */
+static struct spdk_thread *
+bdev_rbd_find_reactor_thread(void)
+{
+	uint32_t lcore;
+
+	SPDK_ENV_FOREACH_CORE(lcore) {
+		struct spdk_reactor *reactor = spdk_reactor_get(lcore);
+		if (reactor == NULL || !reactor->flags.is_valid) {
+			continue;
+		}
+
+		if (reactor->thread_count == 0) {
+			continue;
+		}
+
+		struct spdk_lw_thread *lw_thread = TAILQ_FIRST(&reactor->threads);
+		if (lw_thread == NULL) {
+			continue;
+		}
+
+		struct spdk_thread *thread = spdk_thread_get_from_ctx(lw_thread);
+		if (thread == NULL || spdk_thread_is_app_thread(thread)) {
+			continue;
+		}
+
+		uint64_t thread_id = spdk_thread_get_id(thread);
+		const char *thread_name = spdk_thread_get_name(thread);
+		SPDK_NOTICELOG("bdev_rbd_find_reactor_thread: reactor thread lcore=%u: thread=%p, id=%lu, name=%s\n",
+			       lcore, thread, thread_id, thread_name ? thread_name : "NULL");
+		return thread;
+	}
+
+	return NULL;
+}
 
 static int bdev_rbd_reset_timer(void *arg);
 
@@ -1947,4 +2019,17 @@ void
 bdev_rbd_set_with_crc32c(bool enable)
 {
 	g_rbd_with_crc32c = enable;
+}
+
+bool
+bdev_rbd_get_with_spdk_wq(void)
+{
+	return g_rbd_with_spdk_wq;
+}
+
+/** enable or disable SPDK ContextWQ for RBD operations */
+void
+bdev_rbd_set_with_spdk_wq(bool enable)
+{
+	g_rbd_with_spdk_wq = enable;
 }
