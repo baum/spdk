@@ -625,13 +625,19 @@ _bdev_rbd_start_aio(struct bdev_rbd *disk, struct spdk_bdev_io *bdev_io,
 		break;
 	case SPDK_BDEV_IO_TYPE_WRITE:
 		if (rbd_io->has_crc32c && spdk_likely(iovcnt == 1)) {
+			SPDK_DEBUGLOG(bdev_rbd, "RBD write: rbd_aio_write_with_crc32c offset=%lu len=%zu\n",
+				     offset, iov[0].iov_len);
 			ret = rbd_aio_write_with_crc32c(image, offset, iov[0].iov_len,
 							iov[0].iov_base, rbd_io->precomputed_crc32c,
 							rbd_io->comp, /* op_flags */ 0);
 		} else if (spdk_likely(iovcnt == 1)) {
+			SPDK_DEBUGLOG(bdev_rbd, "RBD write: rbd_aio_write offset=%lu len=%zu\n",
+				     offset, iov[0].iov_len);
 			ret = rbd_aio_write(image, offset, iov[0].iov_len, iov[0].iov_base,
 					    rbd_io->comp);
 		} else {
+			SPDK_DEBUGLOG(bdev_rbd, "RBD write: rbd_aio_writev offset=%lu iovcnt=%d\n",
+				     offset, iovcnt);
 			ret = rbd_aio_writev(image, iov, iovcnt, offset, rbd_io->comp);
 		}
 		break;
