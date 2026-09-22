@@ -5,7 +5,10 @@
 
 #include <rbd/asio/ContextWQ.hpp>
 #include <rados/librados.hpp>
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -92,8 +95,14 @@ std::atomic<std::vector<struct spdk_thread *> *> ReactorThreadPool::g_reactor_li
 std::atomic<uint32_t> ReactorThreadPool::g_reactor_next{0};
 
 /*
- * Lock-free work delivery to a reactor thread.
+ * Lock-free work delivery to a reactor thread (librbd ContextWQ completions).
  *
+ * Submit path (nvmf -> bdev -> rbd_aio_*) stays on submit_td with no ring.
+ * This ring is only for msgr/finisher -> reactor delivery of ContextWQ::Work.
+ * It parallels SPDK's per-thread messages ring (also MP/SC, default 64K) used
+ * by spdk_thread_send_msg(), but keeps payloads on a thread-local SpdkFnMsg
+ * freelist so the common path avoids g_spdk_msg_mempool. If our ring is full,
+ * we fall back to send_msg (thread->messages + shared mempool).
  */
 namespace {
 
@@ -153,14 +162,37 @@ pool_free(SpdkFnMsg *m)
              old, m, std::memory_order_release, std::memory_order_relaxed));
 }
 
+/* SC poller stats: plain uint64_t. MP fallback: relaxed atomic. */
+struct ReactorDispatchStats {
+  std::atomic<uint64_t> fallback{0};
+  uint64_t deq_items = 0;
+  uint64_t deq_batches = 0;
+  uint64_t deq_empty = 0;
+  uint64_t depth_hwm = 0;
+};
+
 struct ReactorDispatch {
   struct spdk_thread *reactor = nullptr;
   struct spdk_ring   *work_ring = nullptr;   /* MP/SC: SpdkFnMsg* to execute */
   struct spdk_poller *poller = nullptr;      /* registered on the reactor */
+  uint32_t ring_size = 0;
+  ReactorDispatchStats stats;
 };
 
-constexpr size_t SPDK_WQ_RING_SIZE = 65536;  /* must be power of two */
-constexpr size_t SPDK_WQ_POLL_BATCH = 64;
+static constexpr uint32_t SPDK_WQ_RING_SIZE_DEFAULT = 65536; /* power of two */
+static constexpr uint32_t SPDK_WQ_RING_SIZE_MIN = 1024;
+static constexpr uint32_t SPDK_WQ_RING_SIZE_MAX = (1u << 20);
+static constexpr size_t SPDK_WQ_POLL_BATCH = 64;
+
+/* Protected by g_dispatch_mutex for set; read at ring create under same lock. */
+static uint32_t g_wq_ring_size = SPDK_WQ_RING_SIZE_DEFAULT;
+static std::atomic<bool> g_wq_fallback_noticed{false};
+
+static bool
+is_power_of_two(uint32_t n)
+{
+  return n != 0 && (n & (n - 1)) == 0;
+}
 
 /* Reactor-context poller: drain the work ring and run each functor inline. */
 static int
@@ -169,6 +201,20 @@ reactor_dispatch_poll(void *arg)
   auto *rd = static_cast<ReactorDispatch *>(arg);
   void *items[SPDK_WQ_POLL_BATCH];
   size_t n = spdk_ring_dequeue(rd->work_ring, items, SPDK_WQ_POLL_BATCH);
+
+  rd->stats.deq_batches++;
+  if (n == 0) {
+    rd->stats.deq_empty++;
+  } else {
+    rd->stats.deq_items += n;
+    /* Sparse depth sample: avoid spdk_ring_count every poll. */
+    if ((rd->stats.deq_batches & 0x3f) == 0) {
+      size_t depth = spdk_ring_count(rd->work_ring);
+      if (depth > rd->stats.depth_hwm) {
+        rd->stats.depth_hwm = depth;
+      }
+    }
+  }
 
   for (size_t i = 0; i < n; i++) {
     auto *m = static_cast<SpdkFnMsg *>(items[i]);
@@ -206,13 +252,19 @@ dispatch_to_reactor(ReactorDispatch *rd, struct spdk_thread *reactor,
   auto *msg = pool_alloc(std::move(fn));
 
   // Fast path: lock-free enqueue into the reactor's MP/SC work ring. The reactor
-  // poller drains it.
+  // poller drains it. No counters on success (multi-producer hot path).
   if (rd != nullptr) {
     void *item = msg;
     if (spdk_ring_enqueue(rd->work_ring, &item, 1, NULL) == 1) {
       return;
     }
     // Ring full: fall through to the legacy path to guarantee forward progress.
+    rd->stats.fallback.fetch_add(1, std::memory_order_relaxed);
+    if (!g_wq_fallback_noticed.exchange(true, std::memory_order_relaxed)) {
+      SPDK_NOTICELOG("bdev_rbd: SpdkContextWQ ring full on reactor=%p (id=%lu); "
+                     "falling back to spdk_thread_send_msg (first occurrence)\n",
+                     reactor, spdk_thread_get_id(reactor));
+    }
   }
 
   // Fallback: legacy cross-thread message. Still correct, just slower.
@@ -250,10 +302,12 @@ get_reactor_dispatch(struct spdk_thread *reactor)
 
   auto *rd = new ReactorDispatch();
   rd->reactor = reactor;
-  rd->work_ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, SPDK_WQ_RING_SIZE,
+  rd->ring_size = g_wq_ring_size;
+  rd->work_ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, rd->ring_size,
                                    SPDK_ENV_NUMA_ID_ANY);
   if (rd->work_ring == nullptr) {
-    SPDK_ERRLOG("bdev_rbd: failed to create dispatch ring for reactor=%p\n", reactor);
+    SPDK_ERRLOG("bdev_rbd: failed to create dispatch ring size=%u for reactor=%p\n",
+                rd->ring_size, reactor);
     delete rd;
     return nullptr;
   }
@@ -403,6 +457,72 @@ void SpdkContextWQ::drain() {
 
 // C API implementation
 extern "C" {
+
+int
+bdev_rbd_wq_set_ring_size(uint32_t ring_size)
+{
+  if (ring_size < SPDK_WQ_RING_SIZE_MIN || ring_size > SPDK_WQ_RING_SIZE_MAX ||
+      !is_power_of_two(ring_size)) {
+    return -EINVAL;
+  }
+
+  std::lock_guard<std::mutex> lk(g_dispatch_mutex);
+  if (!g_dispatch_map.empty()) {
+    return -EBUSY;
+  }
+  g_wq_ring_size = ring_size;
+  SPDK_NOTICELOG("bdev_rbd: SpdkContextWQ ring_size set to %u\n", ring_size);
+  return 0;
+}
+
+uint32_t
+bdev_rbd_wq_get_ring_size(void)
+{
+  std::lock_guard<std::mutex> lk(g_dispatch_mutex);
+  return g_wq_ring_size;
+}
+
+uint32_t
+bdev_rbd_wq_get_poll_batch(void)
+{
+  return SPDK_WQ_POLL_BATCH;
+}
+
+bool
+bdev_rbd_wq_rings_created(void)
+{
+  std::lock_guard<std::mutex> lk(g_dispatch_mutex);
+  return !g_dispatch_map.empty();
+}
+
+void
+bdev_rbd_wq_get_stats(bdev_rbd_wq_stats_fn fn, void *cb_arg)
+{
+  if (fn == nullptr) {
+    return;
+  }
+
+  std::lock_guard<std::mutex> lk(g_dispatch_mutex);
+  for (auto &kv : g_dispatch_map) {
+    ReactorDispatch *rd = kv.second;
+    struct bdev_rbd_wq_reactor_stats s = {};
+    s.thread_id = spdk_thread_get_id(rd->reactor);
+    const char *name = spdk_thread_get_name(rd->reactor);
+    if (name != nullptr) {
+      snprintf(s.thread_name, sizeof(s.thread_name), "%s", name);
+    } else {
+      s.thread_name[0] = '\0';
+    }
+    s.ring_size = rd->ring_size;
+    s.fallback = rd->stats.fallback.load(std::memory_order_relaxed);
+    s.deq_items = rd->stats.deq_items;
+    s.deq_batches = rd->stats.deq_batches;
+    s.deq_empty = rd->stats.deq_empty;
+    s.depth = rd->work_ring != nullptr ? spdk_ring_count(rd->work_ring) : 0;
+    s.depth_hwm = std::max(rd->stats.depth_hwm, s.depth);
+    fn(cb_arg, &s);
+  }
+}
 
 struct bdev_rbd_spdk_context_wq* bdev_rbd_spdk_context_wq_create_from_ioctx(rados_ioctx_t io_ctx, struct spdk_thread* reactor_thread)
 {

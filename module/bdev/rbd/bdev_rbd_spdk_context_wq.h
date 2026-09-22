@@ -6,6 +6,9 @@
 #ifndef SPDK_BDEV_RBD_SPDK_CONTEXT_WQ_H
 #define SPDK_BDEV_RBD_SPDK_CONTEXT_WQ_H
 
+#include <stdbool.h>
+#include <stdint.h>
+
 // Forward declaration for SPDK thread
 struct spdk_thread;
 
@@ -54,6 +57,44 @@ void bdev_rbd_spdk_context_wq_destroy(struct bdev_rbd_spdk_context_wq* context_w
  * Returns NULL if no reactor threads were discovered (error is logged).
  */
 struct spdk_thread* bdev_rbd_find_reactor_thread(void);
+
+/**
+ * Configure SpdkContextWQ per-reactor work-ring size (power of two).
+ * Must be called before any ring is created (before first RBD open with Spdk WQ).
+ *
+ * @return 0 on success, -EINVAL if size invalid, -EBUSY if rings already exist
+ */
+int bdev_rbd_wq_set_ring_size(uint32_t ring_size);
+
+/** Configured ring size (default 65536). */
+uint32_t bdev_rbd_wq_get_ring_size(void);
+
+/** Poller dequeue batch size (constant). */
+uint32_t bdev_rbd_wq_get_poll_batch(void);
+
+/** True once at least one ReactorDispatch ring has been created. */
+bool bdev_rbd_wq_rings_created(void);
+
+struct bdev_rbd_wq_reactor_stats {
+	uint64_t thread_id;
+	char thread_name[64];
+	uint32_t ring_size;
+	uint64_t fallback;
+	uint64_t deq_items;
+	uint64_t deq_batches;
+	uint64_t deq_empty;
+	uint64_t depth;
+	uint64_t depth_hwm;
+};
+
+typedef void (*bdev_rbd_wq_stats_fn)(void *cb_arg,
+				     const struct bdev_rbd_wq_reactor_stats *stats);
+
+/**
+ * Invoke @p fn once per reactor dispatch ring (under an internal lock).
+ * Safe for infrequent monitoring (e.g. 1 Hz RPC).
+ */
+void bdev_rbd_wq_get_stats(bdev_rbd_wq_stats_fn fn, void *cb_arg);
 
 #ifdef __cplusplus
 }
