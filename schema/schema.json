@@ -2717,6 +2717,30 @@
       ]
     },
     {
+      "name": "bdev_rbd_get_wq_options",
+      "private": true,
+      "params": [
+      ]
+    },
+    {
+      "name": "bdev_rbd_set_wq_options",
+      "private": true,
+      "params": [
+        {
+          "name": "ring_size",
+          "type": "uint32",
+          "required": true,
+          "description": "SpdkContextWQ per-reactor work-ring size (power of two, before first ring create)"
+        }
+      ]
+    },
+    {
+      "name": "bdev_rbd_get_wq_stats",
+      "private": true,
+      "params": [
+      ]
+    },
+    {
       "name": "bdev_rbd_delete",
       "params": [
         {
