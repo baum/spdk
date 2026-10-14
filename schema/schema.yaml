@@ -2556,6 +2556,49 @@ methods:
         type: boolean
         required: true
         description: Enable or disable CRC32
+  - name: bdev_rbd_get_with_spdk_wq
+    description: |
+      Get the state of the SPDK reactor work queue for RBD
+
+      This method is available only if SPDK was build with Ceph RBD support.
+    private: true
+    params: []
+  - name: bdev_rbd_set_with_spdk_wq
+    description: |
+      Enable or disable the SPDK reactor work queue for RBD
+
+      This method is available only if SPDK was build with Ceph RBD support.
+    private: true
+    params:
+      - name: enable
+        type: boolean
+        required: true
+        description: Enable or disable the SPDK reactor work queue
+  - name: bdev_rbd_get_wq_options
+    description: |
+      Get SpdkContextWQ options
+
+      This method is available only if SPDK was build with Ceph RBD support.
+    private: true
+    params: []
+  - name: bdev_rbd_set_wq_options
+    description: |
+      Set SpdkContextWQ options
+
+      This method is available only if SPDK was build with Ceph RBD support.
+    private: true
+    params:
+      - name: ring_size
+        type: uint32
+        required: true
+        description: SpdkContextWQ per-reactor work-ring size (power of two, before first ring create)
+  - name: bdev_rbd_get_wq_stats
+    description: |
+      Get SpdkContextWQ per-reactor ring statistics
+
+      This method is available only if SPDK was build with Ceph RBD support.
+    private: true
+    params: []
   - name: bdev_rbd_delete
     description: |
       Delete @ref bdev_config_rbd bdev
