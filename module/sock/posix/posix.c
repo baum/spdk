@@ -36,6 +36,13 @@
 #define SPDK_ZEROCOPY
 #endif
 
+/* Category 1: which SSL call is outstanding, so a later poll waits in the right direction. */
+enum posix_ssl_io_op {
+	POSIX_SSL_OP_NONE = 0,
+	POSIX_SSL_OP_READ,
+	POSIX_SSL_OP_WRITE,
+};
+
 struct posix_connect_ctx {
 	int fd;
 	bool ssl;
@@ -68,6 +75,11 @@ struct spdk_posix_sock {
 
 	SSL_CTX			*ssl_ctx;
 	SSL			*ssl;
+	/* Category 1: SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE for ssl_op, or 0. */
+	int			ssl_want;
+	uint8_t			ssl_op;
+	/* Category 1: EVFILT_WRITE is armed only while OpenSSL needs a write. */
+	bool			kev_write_armed;
 
 	TAILQ_ENTRY(spdk_posix_sock)	link;
 
@@ -607,6 +619,7 @@ err:
 	return 0;
 }
 
+
 static int
 posix_sock_psk_use_session_client_cb(SSL *ssl, const EVP_MD *md, const unsigned char **identity,
 				     size_t *identity_len, SSL_SESSION **sess)
@@ -709,6 +722,13 @@ posix_sock_create_ssl_context(const SSL_METHOD *method, struct spdk_sock_impl_op
 		return NULL;
 	}
 	SPDK_DEBUGLOG(sock_posix, "SSL context created\n");
+
+	/*
+	 * Category 2: a short SSL_write is committed. A WANT_READ or WANT_WRITE
+	 * retry must repeat the same buffer and length. ACCEPT_MOVING_WRITE_BUFFER
+	 * stays off because it corrupts kTLS traffic.
+	 */
+	SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
 
 	switch (impl_opts->tls_version) {
 	case 0:
@@ -833,71 +853,313 @@ posix_sock_configure_ssl(struct spdk_posix_sock *sock, bool client)
 	return 0;
 }
 
-static int
-posix_ssl_get_error(SSL *ssl, int rc)
+/* Category 3: plaintext left in OpenSSL after the kernel socket has been drained. */
+static bool
+posix_ssl_has_pending(const SSL *ssl)
 {
-	switch (SSL_get_error(ssl, rc)) {
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+	return SSL_has_pending(ssl) == 1;
+#else
+	return SSL_pending(ssl) > 0;
+#endif
+}
+
+/* Category 3: the reactor must call SSL_read again without waiting for epoll. */
+static bool
+posix_ssl_keep_readable(const struct spdk_posix_sock *sock)
+{
+	if (sock->ssl == NULL) {
+		return false;
+	}
+	if (posix_ssl_has_pending(sock->ssl)) {
+		return true;
+	}
+	return sock->ssl_op == POSIX_SSL_OP_READ && sock->ssl_want == SSL_ERROR_WANT_WRITE;
+}
+
+static void
+posix_sock_mark_readable(struct spdk_posix_sock *sock)
+{
+	struct spdk_posix_sock_group_impl *group;
+
+	if (sock->base.group_impl == NULL) {
+		return;
+	}
+
+	group = __posix_group_impl(sock->base.group_impl);
+	if (!sock->socket_has_data && !sock->pipe_has_data) {
+		TAILQ_INSERT_TAIL(&group->socks_with_data, sock, link);
+	}
+	sock->socket_has_data = true;
+}
+
+#if defined(SPDK_EPOLL)
+static int
+posix_sock_interest_events(const struct spdk_posix_sock *sock)
+{
+	int events = EPOLLIN | EPOLLERR;
+
+	/* Category 1: SSL_read can return WANT_WRITE, so also poll for writability. */
+	if (sock->ssl != NULL && sock->ssl_want == SSL_ERROR_WANT_WRITE) {
+		events |= EPOLLOUT;
+	}
+	return events;
+}
+#endif
+
+static void
+posix_sock_set_events(struct spdk_posix_sock *sock)
+{
+	struct spdk_posix_sock_group_impl *group;
+	int rc;
+
+	if (sock->base.group_impl == NULL || sock->fd < 0) {
+		return;
+	}
+
+	group = __posix_group_impl(sock->base.group_impl);
+#if defined(SPDK_EPOLL)
+	{
+		struct epoll_event event = {};
+
+		event.events = posix_sock_interest_events(sock);
+		event.data.ptr = sock;
+		rc = epoll_ctl(group->fd, EPOLL_CTL_MOD, sock->fd, &event);
+		if (rc < 0) {
+			SPDK_ERRLOG("epoll_ctl(MOD) failed, errno %d\n", errno);
+		}
+	}
+#elif defined(SPDK_KEVENT)
+	{
+		struct kevent event;
+		struct timespec ts = {0};
+		bool want_write = sock->ssl != NULL && sock->ssl_want == SSL_ERROR_WANT_WRITE;
+
+		if (want_write == sock->kev_write_armed) {
+			return;
+		}
+
+		EV_SET(&event, sock->fd, EVFILT_WRITE, want_write ? EV_ADD : EV_DELETE, 0, 0,
+		       want_write ? sock : NULL);
+		rc = kevent(group->fd, &event, 1, NULL, 0, &ts);
+		if (rc < 0) {
+			SPDK_ERRLOG("kevent(%s EVFILT_WRITE) failed, errno %d\n",
+				    want_write ? "add" : "delete", errno);
+			return;
+		}
+		sock->kev_write_armed = want_write;
+	}
+#else
+	(void)group;
+	(void)rc;
+#endif
+}
+
+static void
+posix_ssl_note_result(struct spdk_posix_sock *sock, int op, int ssl_err, bool must_retry)
+{
+	int prev_want = sock->ssl_want;
+	bool block_other;
+
+	/*
+	 * Category 1: remember whether the retry needs a read or a write.
+	 * Category 4: one SSL state machine. WANT_READ on an established
+	 * SSL_read only means "no plaintext yet", so writes may proceed.
+	 * WANT_WRITE, an unfinished handshake, or any SSL_write retry must
+	 * be repeated before the other direction. The reactor is single
+	 * threaded, so this flag replaces a cross-thread mutex.
+	 */
+	block_other = must_retry &&
+		      (op == POSIX_SSL_OP_WRITE || ssl_err == SSL_ERROR_WANT_WRITE ||
+		       !SSL_is_init_finished(sock->ssl));
+
+	if (block_other && (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE)) {
+		sock->ssl_op = (uint8_t)op;
+		sock->ssl_want = ssl_err;
+	} else {
+		sock->ssl_op = POSIX_SSL_OP_NONE;
+		sock->ssl_want = 0;
+	}
+
+	if (sock->ssl_want != prev_want) {
+		posix_sock_set_events(sock);
+	}
+	if (posix_ssl_keep_readable(sock)) {
+		posix_sock_mark_readable(sock);
+	}
+}
+
+static int
+posix_ssl_translate(struct spdk_posix_sock *sock, int op, int rc)
+{
+	int ssl_err = SSL_get_error(sock->ssl, rc);
+	int syserr = errno;
+
+	switch (ssl_err) {
 	case SSL_ERROR_WANT_READ:
 	case SSL_ERROR_WANT_WRITE:
-	case SSL_ERROR_WANT_CONNECT:
-	case SSL_ERROR_WANT_ACCEPT:
-	case SSL_ERROR_WANT_X509_LOOKUP:
-	case SSL_ERROR_WANT_ASYNC:
-	case SSL_ERROR_WANT_ASYNC_JOB:
-	case SSL_ERROR_WANT_CLIENT_HELLO_CB:
+		/* Category 1: poll for read even after SSL_write, and for write even after SSL_read. */
+		posix_ssl_note_result(sock, op, ssl_err, true);
 		return -EAGAIN;
 	case SSL_ERROR_ZERO_RETURN:
 	case SSL_ERROR_SYSCALL:
-	case SSL_ERROR_SSL:
-	default:
+		if (ssl_err == SSL_ERROR_SYSCALL &&
+		    (syserr == EAGAIN || syserr == EWOULDBLOCK || syserr == EINTR)) {
+			/* Category 1: the BIO blocked. Retry the same SSL call once the socket is ready. */
+			posix_ssl_note_result(sock, op,
+					      op == POSIX_SSL_OP_WRITE ? SSL_ERROR_WANT_WRITE :
+					      SSL_ERROR_WANT_READ, true);
+			return -EAGAIN;
+		}
+		posix_ssl_note_result(sock, op, ssl_err, false);
 		return -ENOTCONN;
+	case SSL_ERROR_SSL:
+		posix_ssl_note_result(sock, op, ssl_err, false);
+		return -ENOTCONN;
+	default:
+		posix_ssl_note_result(sock, op, ssl_err, false);
+		return -EIO;
 	}
 }
 
-static ssize_t
-posix_ssl_readv(SSL *ssl, const struct iovec *iov, int iovcnt)
+/* Category 4: do not start the other direction while an SSL call must be retried. */
+static int
+posix_ssl_io_blocked(struct spdk_posix_sock *sock, int op)
 {
-	int i, rc = 0;
-	ssize_t total = 0;
-
-	for (i = 0; i < iovcnt; i++) {
-		rc = SSL_read(ssl, iov[i].iov_base, iov[i].iov_len);
-
-		if (rc > 0) {
-			total += rc;
-		}
-		if (rc != (int)iov[i].iov_len) {
-			break;
-		}
-	}
-	if (total > 0) {
-		return total;
+	/*
+	 * SPDK reactors are single-threaded per core. There is never more than
+	 * one caller at a time per socket, so allowing the same direction to
+	 * proceed (ssl_op == op) is safe: it simply means no cross-direction
+	 * block is active.
+	 */
+	if (sock->ssl_want == 0 || sock->ssl_op == POSIX_SSL_OP_NONE || sock->ssl_op == op) {
+		return 0;
 	}
 
-	return posix_ssl_get_error(ssl, rc);
+	if (sock->ssl_op == POSIX_SSL_OP_READ) {
+		posix_sock_mark_readable(sock);
+	}
+	return -EAGAIN;
 }
 
 static ssize_t
-posix_ssl_writev(SSL *ssl, struct iovec *iov, int iovcnt)
+posix_ssl_iov_op(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt, bool write)
 {
 	int i, rc = 0;
+	int op = write ? POSIX_SSL_OP_WRITE : POSIX_SSL_OP_READ;
 	ssize_t total = 0;
+	bool did_io = false;
+
+	rc = posix_ssl_io_blocked(sock, op);
+	if (rc < 0) {
+		return rc;
+	}
 
 	for (i = 0; i < iovcnt; i++) {
-		rc = SSL_write(ssl, iov[i].iov_base, iov[i].iov_len);
+		size_t off = 0;
 
-		if (rc > 0) {
-			total += rc;
+		if (iov[i].iov_len == 0) {
+			continue;
 		}
-		if (rc != (int)iov[i].iov_len) {
-			break;
+
+		while (off < iov[i].iov_len) {
+			size_t chunk = iov[i].iov_len - off;
+
+			/*
+			 * Category 2: posix_readv and posix_writev return int.
+			 * Stop before the byte count would not fit, so a retry
+			 * cannot resend bytes the caller could not account for.
+			 */
+			if (total >= INT_MAX) {
+				goto done;
+			}
+			if (chunk > (size_t)INT_MAX) {
+				chunk = (size_t)INT_MAX;
+			}
+			if ((ssize_t)chunk > INT_MAX - total) {
+				chunk = (size_t)(INT_MAX - total);
+			}
+
+			errno = 0;
+			if (write) {
+				rc = SSL_write(sock->ssl, (uint8_t *)iov[i].iov_base + off, (int)chunk);
+			} else {
+				rc = SSL_read(sock->ssl, (uint8_t *)iov[i].iov_base + off, (int)chunk);
+			}
+			did_io = true;
+			if (rc <= 0) {
+				goto done;
+			}
+
+			off += (size_t)rc;
+			total += rc;
+			/* A short SSL_write is committed. A short SSL_read ends this record. */
+			if ((size_t)rc < chunk) {
+				goto done;
+			}
 		}
 	}
+
+done:
+	if (!did_io) {
+		return 0;
+	}
+	if (rc > 0) {
+		posix_ssl_note_result(sock, op, SSL_ERROR_NONE, false);
+		return total;
+	}
 	if (total > 0) {
+		int ssl_err = SSL_get_error(sock->ssl, rc);
+
+		/*
+		 * Category 2: earlier vectors were committed. This vector was
+		 * not, so the next call retries it at the same address and length.
+		 */
+		if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+			posix_ssl_note_result(sock, op, ssl_err, true);
+		} else {
+			posix_ssl_note_result(sock, op, ssl_err, false);
+		}
 		return total;
 	}
 
-	return posix_ssl_get_error(ssl, rc);
+	return posix_ssl_translate(sock, op, rc);
+}
+
+static ssize_t
+posix_ssl_readv(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt)
+{
+	return posix_ssl_iov_op(sock, iov, iovcnt, false);
+}
+
+static ssize_t
+posix_ssl_writev(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt)
+{
+	return posix_ssl_iov_op(sock, iov, iovcnt, true);
+}
+
+static void
+posix_ssl_shutdown(struct spdk_posix_sock *sock)
+{
+	int rc;
+
+	if (sock->ssl == NULL || sock->fd < 0 || !SSL_is_init_finished(sock->ssl)) {
+		return;
+	}
+
+	/*
+	 * Category 5: send close_notify before close(). Do not wait for the
+	 * peer's alert: the reactor cannot block, and RFC 8446 §6.1 permits
+	 * closing the transport after close_notify. SSL_SENT_SHUTDOWN stops
+	 * OpenSSL from retrying the alert on the next SSL_shutdown call.
+	 */
+	SSL_set_shutdown(sock->ssl, SSL_SENT_SHUTDOWN);
+	ERR_clear_error();
+	rc = SSL_shutdown(sock->ssl);
+	if (rc < 0) {
+		/* WANT_* is normal on a non-blocking fd; the alert is already queued. */
+		ERR_clear_error();
+	}
 }
 
 static struct spdk_sock *
@@ -1205,7 +1467,7 @@ posix_sock_close(struct spdk_sock *_sock)
 	sock_posix_connect_ctx_cleanup(&sock->connect_ctx, -ECONNRESET);
 
 	if (sock->ssl != NULL) {
-		SSL_shutdown(sock->ssl);
+		posix_ssl_shutdown(sock);
 	}
 
 	/* If the socket fails to close, the best choice is to
@@ -1333,7 +1595,7 @@ posix_writev(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt, int fl
 	int rc;
 
 	if (sock->ssl) {
-		return posix_ssl_writev(sock->ssl, iov, iovcnt);
+		return posix_ssl_writev(sock, iov, iovcnt);
 	}
 
 	rc = sendmsg(sock->fd, &msg, flags);
@@ -1354,7 +1616,7 @@ posix_readv(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt)
 	int rc;
 
 	if (sock->ssl) {
-		return posix_ssl_readv(sock->ssl, iov, iovcnt);
+		return posix_ssl_readv(sock, iov, iovcnt);
 	}
 
 	rc = readv(sock->fd, iov, iovcnt);
@@ -1559,13 +1821,19 @@ posix_sock_read(struct spdk_posix_sock *sock)
 	rc = posix_readv(sock, iov, 2);
 	assert(sock->pipe_has_data == false);
 	if (rc <= 0) {
-		/* Errors count as draining the socket data */
-		if (sock->base.group_impl && sock->socket_has_data) {
-			group = __posix_group_impl(sock->base.group_impl);
-			TAILQ_REMOVE(&group->socks_with_data, sock, link);
-		}
+		/*
+		 * Category 3: a negative result drains readiness for a plain
+		 * socket. SSL_read can return EAGAIN while plaintext is still
+		 * buffered, or while that SSL_read must be retried on EPOLLOUT.
+		 */
+		if (!posix_ssl_keep_readable(sock)) {
+			if (sock->base.group_impl && sock->socket_has_data) {
+				group = __posix_group_impl(sock->base.group_impl);
+				TAILQ_REMOVE(&group->socks_with_data, sock, link);
+			}
 
-		sock->socket_has_data = false;
+			sock->socket_has_data = false;
+		}
 		return rc;
 	}
 
@@ -1579,8 +1847,13 @@ posix_sock_read(struct spdk_posix_sock *sock)
 #endif
 
 	sock->pipe_has_data = true;
-	if (bytes_recvd < bytes_avail) {
-		/* We drained the kernel socket entirely. */
+	if (bytes_recvd < bytes_avail && !posix_ssl_keep_readable(sock)) {
+		/*
+		 * Category 3: a short read() means the kernel buffer is empty.
+		 * A short SSL_read does not. The rest of the TLS record may
+		 * already be buffered in OpenSSL, or this SSL_read must be
+		 * retried once the socket is writable.
+		 */
 		sock->socket_has_data = false;
 	}
 
@@ -1602,12 +1875,19 @@ posix_sock_readv(struct spdk_sock *_sock, struct iovec *iov, int iovcnt)
 
 	if (sock->recv_pipe == NULL) {
 		assert(sock->pipe_has_data == false);
-		if (group && sock->socket_has_data) {
+		rc = posix_readv(sock, iov, iovcnt);
+		/*
+		 * Category 3: drop readiness after the read. For TLS, keep the
+		 * socket queued when OpenSSL already holds the next plaintext.
+		 * Clearing it first would strand that data: the record has
+		 * left the kernel, so epoll will not fire again.
+		 */
+		if (group && sock->socket_has_data && !posix_ssl_keep_readable(sock)) {
 			sock->socket_has_data = false;
 			TAILQ_REMOVE(&group->socks_with_data, sock, link);
 		}
 
-		return posix_readv(sock, iov, iovcnt);
+		return rc;
 	}
 
 	/* If the socket is not in a group, we must assume it always has
@@ -1947,7 +2227,7 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 
 	memset(&event, 0, sizeof(event));
 	/* EPOLLERR is always on even if we don't set it, but be explicit for clarity */
-	event.events = EPOLLIN | EPOLLERR;
+	event.events = posix_sock_interest_events(sock);
 	event.data.ptr = sock;
 
 	rc = epoll_ctl(group->fd, EPOLL_CTL_ADD, sock->fd, &event);
@@ -1963,6 +2243,13 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 		return -errno;
 	}
 
+#if defined(SPDK_KEVENT)
+	/* Category 1: the read filter is installed above. Arm EVFILT_WRITE for a WANT_WRITE retry. */
+	if (sock->ssl != NULL && sock->ssl_want == SSL_ERROR_WANT_WRITE) {
+		posix_sock_set_events(sock);
+	}
+#endif
+
 	/* switched from another polling group due to scheduling */
 	if (spdk_unlikely(sock->recv_pipe != NULL  &&
 			  (spdk_pipe_reader_bytes_available(sock->recv_pipe) > 0))) {
@@ -1972,6 +2259,13 @@ posix_sock_group_impl_add_sock(struct spdk_sock_group_impl *_group, struct spdk_
 	} else if (sock->recv_pipe != NULL) {
 		rc = spdk_pipe_group_add(group->pipe_group, sock->recv_pipe);
 		assert(rc == 0);
+	}
+
+	if (posix_ssl_keep_readable(sock)) {
+		if (!sock->socket_has_data && !sock->pipe_has_data) {
+			TAILQ_INSERT_TAIL(&group->socks_with_data, sock, link);
+		}
+		sock->socket_has_data = true;
 	}
 
 	if (_sock->impl_opts.enable_placement_id == PLACEMENT_MARK) {
@@ -2020,6 +2314,13 @@ posix_sock_group_impl_remove_sock(struct spdk_sock_group_impl *_group, struct sp
 #elif defined(SPDK_KEVENT)
 	struct kevent event;
 	struct timespec ts = {0};
+
+	/* Category 1: drop the write filter armed for a WANT_WRITE retry. */
+	if (sock->kev_write_armed) {
+		EV_SET(&event, sock->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+		kevent(group->fd, &event, 1, NULL, 0, &ts);
+		sock->kev_write_armed = false;
+	}
 
 	EV_SET(&event, sock->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
 
@@ -2148,13 +2449,25 @@ posix_sock_group_impl_poll(struct spdk_sock_group_impl *_group, int max_events,
 			}
 		}
 #endif
-		if ((events[i].events & EPOLLIN) == 0) {
+		/*
+		 * Category 1: EPOLLOUT is armed only while an SSL_read must be
+		 * retried after WANT_WRITE. A pending SSL_write is retried by flush.
+		 */
+		if ((events[i].events & EPOLLIN) == 0 &&
+		    !((events[i].events & EPOLLOUT) && psock->ssl &&
+		      psock->ssl_op == POSIX_SSL_OP_READ &&
+		      psock->ssl_want == SSL_ERROR_WANT_WRITE)) {
 			continue;
 		}
 
 #elif defined(SPDK_KEVENT)
 		sock = events[i].udata;
 		psock = __posix_sock(sock);
+		if (events[i].filter == EVFILT_WRITE &&
+		    !(psock->ssl && psock->ssl_op == POSIX_SSL_OP_READ &&
+		      psock->ssl_want == SSL_ERROR_WANT_WRITE)) {
+			continue;
+		}
 #endif
 
 		/* If the socket is not already in the list, add it now */
@@ -2348,6 +2661,7 @@ posix_connect_poller(struct spdk_posix_sock *sock)
 
 err:
 	/* It is safe to pass NULL to SSL free functions. */
+	posix_ssl_shutdown(sock);
 	SSL_free(sock->ssl);
 	SSL_CTX_free(sock->ssl_ctx);
 	sock->ssl = NULL;
