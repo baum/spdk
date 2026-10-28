@@ -377,7 +377,10 @@ hello_sock_connect(struct hello_context_t *ctx)
 
 	spdk_sock_impl_get_opts(ctx->sock_impl_name, &impl_opts, &impl_opts_size);
 	impl_opts.enable_ktls = ctx->ktls;
-	impl_opts.tls_version = ctx->tls_version;
+	/* Leave 0 alone so the ssl impl keeps its TLS 1.3 default. */
+	if (ctx->tls_version != 0) {
+		impl_opts.tls_version = ctx->tls_version;
+	}
 	impl_opts.psk_identity = ctx->psk_identity;
 	impl_opts.tls_cipher_suites = "TLS_AES_128_GCM_SHA256";
 	impl_opts.psk_key = ctx->psk_key;
@@ -505,7 +508,10 @@ hello_sock_listen(struct hello_context_t *ctx)
 
 	spdk_sock_impl_get_opts(ctx->sock_impl_name, &impl_opts, &impl_opts_size);
 	impl_opts.enable_ktls = ctx->ktls;
-	impl_opts.tls_version = ctx->tls_version;
+	/* Leave 0 alone so the ssl impl keeps its TLS 1.3 default. */
+	if (ctx->tls_version != 0) {
+		impl_opts.tls_version = ctx->tls_version;
+	}
 	impl_opts.psk_identity = ctx->psk_identity;
 	impl_opts.tls_cipher_suites = "TLS_AES_128_GCM_SHA256";
 	impl_opts.psk_key = ctx->psk_key;

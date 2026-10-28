@@ -1004,16 +1004,32 @@ nvmf_tcp_find_port(struct spdk_nvmf_tcp_transport *ttransport,
 }
 
 static int
-tcp_sock_get_key(uint8_t *out, int out_len, const char **cipher, const char *pskid,
-		 void *get_key_ctx)
+tcp_sock_get_key(uint8_t *out, int out_len, const char **cipher, const void *psk_identity,
+		 size_t identity_len, void *get_key_ctx)
 {
 	struct tcp_psk_entry *entry;
 	struct spdk_nvmf_tcp_transport *ttransport = get_key_ctx;
+	char pskid[NVMF_PSK_IDENTITY_LEN];
 	size_t psk_len;
 	int rc;
 
+	/*
+	 * OpenSSL does not NUL-terminate the identity from the ClientHello.
+	 * Copy identity_len bytes before nvme_tcp_derive_tls_psk, which needs
+	 * a C string. An unknown identity is -ENOENT so the handshake can try
+	 * the next one instead of failing the whole list.
+	 */
+	if (psk_identity == NULL || identity_len == 0 || identity_len >= sizeof(pskid) ||
+	    memchr(psk_identity, '\0', identity_len) != NULL) {
+		return -ENOENT;
+	}
+
+	memcpy(pskid, psk_identity, identity_len);
+	pskid[identity_len] = '\0';
+
 	TAILQ_FOREACH(entry, &ttransport->psks, link) {
-		if (strcmp(pskid, entry->pskid) != 0) {
+		if (strlen(entry->pskid) != identity_len ||
+		    memcmp(entry->pskid, psk_identity, identity_len) != 0) {
 			continue;
 		}
 
@@ -1048,7 +1064,7 @@ tcp_sock_get_key(uint8_t *out, int out_len, const char **cipher, const char *psk
 
 	SPDK_ERRLOG("Could not find PSK for identity: %s\n", pskid);
 
-	return -EINVAL;
+	return -ENOENT;
 }
 
 static int

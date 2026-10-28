@@ -170,12 +170,16 @@ struct spdk_sock_impl_opts {
 	 * \param out_len Length of "out" buffer.
 	 * \param cipher Cipher suite to be set by this callback.
 	 * \param psk_identity PSK identity for which the key needs to be found.
+	 * OpenSSL passes a pointer into the ClientHello, not a C string.
+	 * \param identity_len Length of psk_identity in bytes.
 	 * \param get_key_ctx Context for this callback.
 	 *
-	 * \return key length on success, -1 on failure.
+	 * \return key length on success, -ENOENT when the identity is unknown,
+	 * other negative errno on failure. -ENOENT lets the TLS handshake try
+	 * another offered identity. Any other error fails the handshake.
 	 */
-	int (*get_key)(uint8_t *out, int out_len, const char **cipher, const char *psk_identity,
-		       void *get_key_ctx);
+	int (*get_key)(uint8_t *out, int out_len, const char **cipher, const void *psk_identity,
+		       size_t identity_len, void *get_key_ctx);
 
 	/**
 	 * Context to be passed to get_key() callback.

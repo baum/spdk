@@ -128,7 +128,8 @@ static struct spdk_sock_impl_opts g_ssl_impl_opts = {
 	.enable_zerocopy_send_server = true,
 	.enable_zerocopy_send_client = false,
 	.zerocopy_threshold = 0,
-	.tls_version = 0,
+	/* NVMe-oF TLS PSK is TLS 1.3. 0 would leave the version to auto-negotiation. */
+	.tls_version = SPDK_TLS_VERSION_1_3,
 	.enable_ktls = false,
 	.psk_key = NULL,
 	.psk_identity = NULL,
@@ -529,18 +530,36 @@ posix_sock_psk_find_session_server_cb(SSL *ssl, const unsigned char *identity,
 {
 	struct spdk_sock_impl_opts *impl_opts = SSL_get_app_data(ssl);
 	uint8_t key[SSL_MAX_MASTER_KEY_LENGTH] = {};
-	int keylen;
+	int keylen = 0;
 	int rc, i;
 	STACK_OF(SSL_CIPHER) *ciphers;
 	const SSL_CIPHER *cipher;
-	const char *cipher_name;
+	const char *cipher_name = NULL;
 	const char *user_cipher = NULL;
 	bool found = false;
 
+	/*
+	 * The identity pointer is into the ClientHello and is not a C string.
+	 * The bytes after identity_len are the obfuscated ticket age. Returning
+	 * 0 makes OpenSSL abort every remaining identity, so an unknown session
+	 * ticket must return success with no session. The NVMe PSK is tried next.
+	 */
+	*sess = NULL;
+
+	if (impl_opts == NULL || identity == NULL) {
+		return 0;
+	}
+
 	if (impl_opts->get_key) {
-		rc = impl_opts->get_key(key, sizeof(key), &user_cipher, identity, impl_opts->get_key_ctx);
+		rc = impl_opts->get_key(key, sizeof(key), &user_cipher, identity, identity_len,
+					impl_opts->get_key_ctx);
+		if (rc == -ENOENT) {
+			/* Unknown identity is not fatal. Another offered identity may match. */
+			OPENSSL_cleanse(key, sizeof(key));
+			return 1;
+		}
 		if (rc < 0) {
-			SPDK_ERRLOG("Unable to find PSK for identity: %s\n", identity);
+			SPDK_ERRLOG("Unable to load PSK for identity of length %zu\n", identity_len);
 			return 0;
 		}
 		keylen = rc;
@@ -555,26 +574,36 @@ posix_sock_psk_find_session_server_cb(SSL *ssl, const unsigned char *identity,
 			return 0;
 		}
 
-		SPDK_DEBUGLOG(sock_posix, "Length of Client's PSK ID %lu\n", strlen(impl_opts->psk_identity));
-		if (strcmp(impl_opts->psk_identity, identity) != 0) {
-			SPDK_ERRLOG("Unknown Client's PSK ID\n");
+		if (identity_len != strlen(impl_opts->psk_identity) ||
+		    memcmp(impl_opts->psk_identity, identity, identity_len) != 0) {
+			SPDK_DEBUGLOG(sock_posix, "Unknown Client PSK identity, length %zu\n",
+				      identity_len);
+			return 1;
+		}
+		if (impl_opts->psk_key_size == 0 ||
+		    impl_opts->psk_key_size > sizeof(key)) {
+			SPDK_ERRLOG("PSK length %u is invalid\n", impl_opts->psk_key_size);
 			return 0;
 		}
-		keylen = impl_opts->psk_key_size;
-
+		keylen = (int)impl_opts->psk_key_size;
 		memcpy(key, impl_opts->psk_key, keylen);
 		user_cipher = impl_opts->tls_cipher_suites;
 	}
 
+	if (keylen <= 0 || (size_t)keylen > sizeof(key)) {
+		SPDK_ERRLOG("PSK length %d is invalid\n", keylen);
+		goto err;
+	}
+
 	if (user_cipher == NULL) {
 		SPDK_ERRLOG("Cipher suite not set\n");
-		return 0;
+		goto err;
 	}
 
 	*sess = SSL_SESSION_new();
 	if (*sess == NULL) {
 		SPDK_ERRLOG("Unable to allocate new SSL session\n");
-		return 0;
+		goto err;
 	}
 
 	ciphers = SSL_get_ciphers(ssl);
@@ -606,19 +635,22 @@ posix_sock_psk_find_session_server_cb(SSL *ssl, const unsigned char *identity,
 	}
 
 	rc = SSL_SESSION_set1_master_key(*sess, key, keylen);
+	OPENSSL_cleanse(key, sizeof(key));
 	if (rc != 1) {
 		SPDK_ERRLOG("Unable to set PSK for session\n");
-		goto err;
+		SSL_SESSION_free(*sess);
+		*sess = NULL;
+		return 0;
 	}
 
 	return 1;
 
 err:
+	OPENSSL_cleanse(key, sizeof(key));
 	SSL_SESSION_free(*sess);
 	*sess = NULL;
 	return 0;
 }
-
 
 static int
 posix_sock_psk_use_session_client_cb(SSL *ssl, const EVP_MD *md, const unsigned char **identity,
@@ -729,6 +761,15 @@ posix_sock_create_ssl_context(const SSL_METHOD *method, struct spdk_sock_impl_op
 	 * stays off because it corrupts kTLS traffic.
 	 */
 	SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
+	/*
+	 * TLS 1.2 renegotiation inserts handshake records into application data
+	 * and produces extra WANT_READ and WANT_WRITE results. NVMe-oF PSK uses
+	 * TLS 1.3, which has no renegotiation. Refuse it where OpenSSL still
+	 * allows it.
+	 */
+#ifdef SSL_OP_NO_RENEGOTIATION
+	SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
+#endif
 
 	switch (impl_opts->tls_version) {
 	case 0:
@@ -799,7 +840,12 @@ ssl_sock_setup_connect(SSL_CTX *ctx, int fd)
 		SPDK_ERRLOG("SSL_new() failed, msg = %s\n", ERR_error_string(ERR_peek_last_error(), NULL));
 		return NULL;
 	}
-	SSL_set_fd(ssl, fd);
+	/* A failed SSL_set_fd leaves this SSL object detached from the socket. */
+	if (SSL_set_fd(ssl, fd) != 1) {
+		SPDK_ERRLOG("SSL_set_fd() failed, msg = %s\n", ERR_error_string(ERR_peek_last_error(), NULL));
+		SSL_free(ssl);
+		return NULL;
+	}
 	SSL_set_connect_state(ssl);
 	SSL_set_psk_use_session_callback(ssl, posix_sock_psk_use_session_client_cb);
 	SPDK_DEBUGLOG(sock_posix, "SSL object creation finished: %p\n", ssl);
@@ -819,7 +865,12 @@ ssl_sock_setup_accept(SSL_CTX *ctx, int fd)
 		SPDK_ERRLOG("SSL_new() failed, msg = %s\n", ERR_error_string(ERR_peek_last_error(), NULL));
 		return NULL;
 	}
-	SSL_set_fd(ssl, fd);
+	/* A failed SSL_set_fd leaves this SSL object detached from the socket. */
+	if (SSL_set_fd(ssl, fd) != 1) {
+		SPDK_ERRLOG("SSL_set_fd() failed, msg = %s\n", ERR_error_string(ERR_peek_last_error(), NULL));
+		SSL_free(ssl);
+		return NULL;
+	}
 	SSL_set_accept_state(ssl);
 	SSL_set_psk_find_session_callback(ssl, posix_sock_psk_find_session_server_cb);
 	SPDK_DEBUGLOG(sock_posix, "SSL object creation finished: %p\n", ssl);
@@ -1002,9 +1053,11 @@ posix_ssl_translate(struct spdk_posix_sock *sock, int op, int rc)
 		posix_ssl_note_result(sock, op, ssl_err, true);
 		return -EAGAIN;
 	case SSL_ERROR_ZERO_RETURN:
+		posix_ssl_note_result(sock, op, ssl_err, false);
+		/* read() returns 0 on a clean EOF. A write to that peer has failed. */
+		return op == POSIX_SSL_OP_WRITE ? -ECONNRESET : 0;
 	case SSL_ERROR_SYSCALL:
-		if (ssl_err == SSL_ERROR_SYSCALL &&
-		    (syserr == EAGAIN || syserr == EWOULDBLOCK || syserr == EINTR)) {
+		if (syserr == EAGAIN || syserr == EWOULDBLOCK || syserr == EINTR) {
 			/* Category 1: the BIO blocked. Retry the same SSL call once the socket is ready. */
 			posix_ssl_note_result(sock, op,
 					      op == POSIX_SSL_OP_WRITE ? SSL_ERROR_WANT_WRITE :
@@ -1012,13 +1065,30 @@ posix_ssl_translate(struct spdk_posix_sock *sock, int op, int rc)
 			return -EAGAIN;
 		}
 		posix_ssl_note_result(sock, op, ssl_err, false);
-		return -ENOTCONN;
-	case SSL_ERROR_SSL:
-		posix_ssl_note_result(sock, op, ssl_err, false);
-		return -ENOTCONN;
-	default:
-		posix_ssl_note_result(sock, op, ssl_err, false);
+		/* Peer closed without a close_notify. Same as a plain read() EOF. */
+		if (rc == 0 && syserr == 0) {
+			return op == POSIX_SSL_OP_WRITE ? -ECONNRESET : 0;
+		}
+		if (syserr != 0) {
+			return -syserr;
+		}
 		return -EIO;
+	case SSL_ERROR_SSL:
+		SPDK_ERRLOG("SSL error: %s\n", ERR_error_string(ERR_peek_error(), NULL));
+		ERR_clear_error();
+		posix_ssl_note_result(sock, op, ssl_err, false);
+		return -EPROTO;
+	case SSL_ERROR_WANT_CONNECT:
+	case SSL_ERROR_WANT_ACCEPT:
+	case SSL_ERROR_WANT_X509_LOOKUP:
+	case SSL_ERROR_WANT_ASYNC:
+	case SSL_ERROR_WANT_ASYNC_JOB:
+	case SSL_ERROR_WANT_CLIENT_HELLO_CB:
+	default:
+		SPDK_ERRLOG("Unexpected SSL_get_error() %d\n", ssl_err);
+		ERR_clear_error();
+		posix_ssl_note_result(sock, op, ssl_err, false);
+		return -EPROTO;
 	}
 }
 
@@ -1080,6 +1150,8 @@ posix_ssl_iov_op(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt, bo
 				chunk = (size_t)(INT_MAX - total);
 			}
 
+			/* A stale error queue makes SSL_get_error pick the wrong WANT_ direction. */
+			ERR_clear_error();
 			errno = 0;
 			if (write) {
 				rc = SSL_write(sock->ssl, (uint8_t *)iov[i].iov_base + off, (int)chunk);
@@ -1102,7 +1174,8 @@ posix_ssl_iov_op(struct spdk_posix_sock *sock, struct iovec *iov, int iovcnt, bo
 
 done:
 	if (!did_io) {
-		return 0;
+		/* A read of no bytes must not return 0: callers treat 0 as EOF. */
+		return write ? 0 : -EINVAL;
 	}
 	if (rc > 0) {
 		posix_ssl_note_result(sock, op, SSL_ERROR_NONE, false);
@@ -2688,9 +2761,30 @@ out:
 	return rc;
 }
 
+static void
+posix_ignore_sigpipe(void)
+{
+	struct sigaction sa = {}, old;
+
+	/*
+	 * OpenSSL's socket BIO calls write() and does not pass MSG_NOSIGNAL.
+	 * A peer reset would otherwise kill the process with SIGPIPE. The plain
+	 * socket path already passes MSG_NOSIGNAL. Ignore SIGPIPE only when the
+	 * handler is still the default, so an application handler is preserved.
+	 */
+	sigemptyset(&sa.sa_mask);
+	if (sigaction(SIGPIPE, NULL, &old) == 0 && old.sa_handler == SIG_DFL) {
+		sa.sa_handler = SIG_IGN;
+		if (sigaction(SIGPIPE, &sa, NULL) < 0) {
+			SPDK_ERRLOG("sigaction(SIGPIPE, SIG_IGN) failed\n");
+		}
+	}
+}
+
 static int
 posix_net_impl_init(struct spdk_sock_initialize_opts *opts)
 {
+	posix_ignore_sigpipe();
 	return 0;
 }
 
@@ -2750,6 +2844,7 @@ ssl_sock_accept(struct spdk_sock *_sock)
 static int
 ssl_net_impl_init(struct spdk_sock_initialize_opts *opts)
 {
+	posix_ignore_sigpipe();
 	return 0;
 }
 
