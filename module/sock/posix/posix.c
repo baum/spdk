@@ -868,7 +868,9 @@ posix_ssl_get_error(SSL *ssl, int rc)
 	case SSL_ERROR_ZERO_RETURN:
 		return 0;
 	case SSL_ERROR_SYSCALL:
-		if (errno != 0) {
+		/* errno is meaningful only when this call set it. Callers zero it first.
+		 * EAGAIN left over from an earlier syscall must not look retryable. */
+		if (errno != 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 			return -errno;
 		}
 		return -ECONNRESET;
@@ -995,6 +997,7 @@ posix_ssl_readv(struct spdk_posix_sock *sock, const struct iovec *iov, int iovcn
 		size_t len = iov[i].iov_len;
 
 		while (len > 0) {
+			errno = 0;
 			rc = SSL_read(ssl, base, len);
 			if (rc > 0) {
 				total += rc;
@@ -1008,7 +1011,10 @@ posix_ssl_readv(struct spdk_posix_sock *sock, const struct iovec *iov, int iovcn
 				break;
 			}
 		}
-		if (rc <= 0) {
+		/* A short read must not continue into the next iovec. The caller treats
+		 * the byte count as a contiguous prefix, so bytes in iov[i + 1] while
+		 * iov[i] is only partly filled would corrupt a multi-iov PDU. */
+		if (rc <= 0 || len > 0) {
 			break;
 		}
 	}
@@ -1046,6 +1052,7 @@ posix_ssl_writev(SSL *ssl, struct iovec *iov, int iovcnt)
 	/* Same queue rule as posix_ssl_readv(): a stale error makes SSL_get_error() lie. */
 	ssl_check_stale_err(ssl, "SSL_write");
 	for (i = 0; i < iovcnt; i++) {
+		errno = 0;
 		rc = SSL_write(ssl, iov[i].iov_base, iov[i].iov_len);
 
 		if (rc > 0) {
@@ -1061,6 +1068,11 @@ posix_ssl_writev(SSL *ssl, struct iovec *iov, int iovcnt)
 
 	sys_errno = errno;
 	ssl_err = SSL_get_error(ssl, rc);
+	/* close_notify. Returning 0 looks like a zero-length write, and
+	 * _sock_flush() retries that forever. */
+	if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+		return -ECONNRESET;
+	}
 	if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE &&
 	    ssl_err != SSL_ERROR_WANT_CLIENT_HELLO_CB) {
 		ssl_log_fatal(ssl, "SSL_write", rc, ssl_err, sys_errno);

@@ -1051,7 +1051,10 @@ tcp_sock_get_key(uint8_t *out, int out_len, const char **cipher, const char *psk
 		return rc;
 	}
 
-	SPDK_ERRLOG("Could not find PSK for identity: %s\n", pskid);
+	/* pskid is the raw identity from OpenSSL, not a C string. A TLS 1.3
+	 * session ticket is offered first and will not match; that is not
+	 * a failure. Do not print it with %s. */
+	SPDK_DEBUGLOG(nvmf_tcp, "No PSK for the offered identity\n");
 
 	return -EINVAL;
 }
