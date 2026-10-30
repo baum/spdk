@@ -976,6 +976,24 @@ ssl_log_fatal(SSL *ssl, const char *op, int rc, int ssl_err, int sys_errno)
 		    SSL_is_init_finished(ssl), SSL_state_string_long(ssl), fbuf, lbuf);
 }
 
+/* OpenSSL 3 reports a TCP close before the handshake as SSL_ERROR_SSL /
+ * unexpected EOF, not as ECONNRESET. nvme_tcp_read_data() logs every recv
+ * error except -ECONNRESET, so a port probe would otherwise be an I/O error. */
+static bool
+ssl_peer_closed_during_handshake(SSL *ssl, int ssl_err)
+{
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+	if (ssl_err != SSL_ERROR_SSL || SSL_is_init_finished(ssl)) {
+		return false;
+	}
+	return ERR_GET_REASON(ERR_peek_error()) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
+#else
+	(void)ssl;
+	(void)ssl_err;
+	return false;
+#endif
+}
+
 /* N#3 The Internal Buffering Trap */
 static ssize_t
 posix_ssl_readv(struct spdk_posix_sock *sock, const struct iovec *iov, int iovcnt)
@@ -1035,6 +1053,9 @@ posix_ssl_readv(struct spdk_posix_sock *sock, const struct iovec *iov, int iovcn
 	if (total > 0) {
 		return total;
 	}
+	if (ssl_peer_closed_during_handshake(ssl, ssl_err)) {
+		return -ECONNRESET;
+	}
 	if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE &&
 	    ssl_err != SSL_ERROR_WANT_CLIENT_HELLO_CB) {
 		ssl_log_fatal(ssl, "SSL_read", rc, ssl_err, sys_errno);
@@ -1071,6 +1092,9 @@ posix_ssl_writev(SSL *ssl, struct iovec *iov, int iovcnt)
 	/* close_notify. Returning 0 looks like a zero-length write, and
 	 * _sock_flush() retries that forever. */
 	if (ssl_err == SSL_ERROR_ZERO_RETURN) {
+		return -ECONNRESET;
+	}
+	if (ssl_peer_closed_during_handshake(ssl, ssl_err)) {
 		return -ECONNRESET;
 	}
 	if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE &&
