@@ -303,7 +303,10 @@ get_reactor_dispatch(struct spdk_thread *reactor)
   auto *rd = new ReactorDispatch();
   rd->reactor = reactor;
   rd->ring_size = g_wq_ring_size;
-  rd->work_ring = spdk_ring_create(SPDK_RING_TYPE_MP_SC, rd->ring_size,
+  /* Messenger threads produce. RTS so a preempted producer does not
+   * stall the others. The reactor poller is the only consumer.
+   */
+  rd->work_ring = spdk_ring_create(SPDK_RING_TYPE_MP_RTS_SC, rd->ring_size,
                                    SPDK_ENV_NUMA_ID_ANY);
   if (rd->work_ring == nullptr) {
     SPDK_ERRLOG("bdev_rbd: failed to create dispatch ring size=%u for reactor=%p\n",
